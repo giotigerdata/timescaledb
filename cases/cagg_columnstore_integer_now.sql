@@ -2,34 +2,52 @@
 -- Case:  00040119
 -- Service / project: p3dthsrulv / gbvx1g57lj
 --
--- Repro: columnstore policy on continuous aggregates fails with
+-- Repro: columnstore policy on a continuous aggregate fails with
 --        "integer_now function not set"
 --
 -- Setup (mirrors the customer's environment):
 --   - Base hypertable `sqlth_34_data` chunked by an int8 epoch-ms column
 --     (`t_stamp`), with a user-defined `now_ms()` set as the
 --     `integer_now_func` on the base hypertable.
---   - Two stacked continuous aggregates: `tag_values_1s_agg` on the base,
---     and `tag_values_1m_agg` on the inner cagg.
---   - Columnstore enabled + columnstore policy on the base and both caggs.
+--   - Continuous aggregate `tag_values_1s_agg` on the base hypertable.
+--     (Customer has a multi-level stack — one level is enough to repro.
+--      Stacking cagg-on-cagg over integer time on PG18 hits a SEPARATE
+--      validator issue we don't address here.)
+--   - Columnstore enabled + columnstore policy on the base and the cagg.
 --
 -- Expected behavior with the bug:
 --   - The base hypertable's columnstore policy job SUCCEEDS.
---   - Both cagg columnstore policy jobs FAIL with
+--   - The cagg columnstore policy job FAILS with
 --       ERROR: integer_now function not set
---   - Manual `convert_to_columnstore(<cagg chunk>)` SUCCEEDS.
+--   - Manual `convert_to_columnstore(<cagg chunk>)` SUCCEEDS regardless.
 --
--- Root cause (timescaledb tsl/src/bgw_policy/job.c policy_recompression_execute):
+-- Root cause (tsl/src/bgw_policy/job.c policy_recompression_execute):
 --   The policy looks up the open dimension on the cagg's materialization
---   hypertable directly. The mat hypertable's dimension has empty
---   integer_now_func / integer_now_func_schema (only the original base
---   hypertable has those populated), so ts_get_integer_now_func() raises.
+--   hypertable directly. That dimension has empty
+--   integer_now_func / integer_now_func_schema — only the original base
+--   hypertable has those populated. ts_get_integer_now_func() then raises.
 --   The retention policy path does it correctly via
---   ts_continuous_agg_find_integer_now_func_by_materialization_id() — the
+--   ts_continuous_agg_find_integer_now_func_by_materialization_id(); the
 --   columnstore/recompression path does not.
 --
--- Workaround demonstrated at the bottom of this script:
+-- Workaround (demonstrated below):
 --   set_integer_now_func() on the materialization hypertable directly.
+--
+-- ----------------------------------------------------------------------------
+-- Notes for running this script:
+--
+--   * Designed for `psql -f`. With \set ON_ERROR_STOP off, psql keeps going
+--     after errors so you can see the BEFORE (fail) and AFTER (succeed)
+--     states in one run.
+--
+--   * `CALL run_job(...)` issues internal COMMITs and CANNOT be wrapped in a
+--     PL/pgSQL BEGIN/EXCEPTION block — that creates a subtransaction and
+--     produces a spurious "cannot commit while a subtransaction is active"
+--     that masks the real error. So we capture job ids with \gset and CALL
+--     run_job at the top level.
+--
+--   * Integer-arithmetic gotcha: `30 * 86400000` is int4 * int4 and
+--     overflows int4. Always cast the LITERAL: `30::BIGINT * 86400000`.
 -- ============================================================================
 
 \set ON_ERROR_STOP off
@@ -39,7 +57,6 @@
 -- ---------------------------------------------------------------------------
 -- 0. Clean prior repro state (idempotent).
 -- ---------------------------------------------------------------------------
-DROP MATERIALIZED VIEW IF EXISTS tag_values_1m_agg CASCADE;
 DROP MATERIALIZED VIEW IF EXISTS tag_values_1s_agg CASCADE;
 DROP TABLE IF EXISTS sqlth_34_data CASCADE;
 DROP FUNCTION IF EXISTS now_ms() CASCADE;
@@ -71,8 +88,8 @@ $$;
 SELECT set_integer_now_func('sqlth_34_data', 'now_ms');
 
 -- ---------------------------------------------------------------------------
--- 3. Insert 30 days of synthetic data so we have many chunks, most of which
---    are older than the compress_after window (7 days).
+-- 3. Insert 30 days of synthetic data so we get many chunks, most older
+--    than the 7-day compress_after window.
 -- ---------------------------------------------------------------------------
 INSERT INTO sqlth_34_data (tagid, intvalue, t_stamp)
 SELECT
@@ -81,12 +98,11 @@ SELECT
     (EXTRACT(epoch FROM now() - (g || ' minutes')::interval) * 1000)::BIGINT
 FROM generate_series(1, 30 * 24 * 60) g;
 
-SELECT count(*) AS row_count FROM sqlth_34_data;
+SELECT count(*) AS row_count   FROM sqlth_34_data;
 SELECT count(*) AS chunk_count FROM show_chunks('sqlth_34_data');
 
 -- ---------------------------------------------------------------------------
--- 4. Enable columnstore + add columnstore policy on the base hypertable.
---    compress_after = 7 days in ms.
+-- 4. Enable columnstore on the base hypertable.
 -- ---------------------------------------------------------------------------
 ALTER TABLE sqlth_34_data SET (
     timescaledb.enable_columnstore = true,
@@ -94,7 +110,8 @@ ALTER TABLE sqlth_34_data SET (
 );
 
 -- ---------------------------------------------------------------------------
--- 5. Stacked continuous aggregates.
+-- 5. Continuous aggregate on the base hypertable, plus a refresh policy
+--    (required before a columnstore policy can be attached to a cagg).
 -- ---------------------------------------------------------------------------
 CREATE MATERIALIZED VIEW tag_values_1s_agg
 WITH (timescaledb.continuous) AS
@@ -109,49 +126,50 @@ WITH NO DATA;
 
 CALL refresh_continuous_aggregate('tag_values_1s_agg', NULL, NULL);
 
-CREATE MATERIALIZED VIEW tag_values_1m_agg
-WITH (timescaledb.continuous) AS
-SELECT
-    tagid,
-    time_bucket(3600000, bucket) AS bucket,   -- 1-hour buckets (ms)
-    avg(avg_v) AS avg_v
-FROM tag_values_1s_agg
-GROUP BY tagid, bucket
-WITH NO DATA;
-
-CALL refresh_continuous_aggregate('tag_values_1m_agg', NULL, NULL);
-
--- ---------------------------------------------------------------------------
--- 6. Enable columnstore on both caggs.
--- ---------------------------------------------------------------------------
 ALTER MATERIALIZED VIEW tag_values_1s_agg SET (
     timescaledb.enable_columnstore = true,
     timescaledb.segmentby = 'tagid'
 );
-ALTER MATERIALIZED VIEW tag_values_1m_agg SET (
-    timescaledb.enable_columnstore = true,
-    timescaledb.segmentby = 'tagid'
+
+-- start_offset must be BIGINT-typed because 30 * 86400000 overflows int4.
+SELECT add_continuous_aggregate_policy(
+    continuous_aggregate => 'tag_values_1s_agg',
+    start_offset         => 30::BIGINT * 86400000,
+    end_offset           => 60000::BIGINT,
+    schedule_interval    => INTERVAL '1 hour'
 );
 
 -- ---------------------------------------------------------------------------
--- 7. Register columnstore policies. Capture the resulting job ids.
---
--- Note: if your TimescaleDB version predates the columnstore rename, use
---       add_compression_policy() with the same signature.
+-- 6. Register the columnstore policies (base + cagg).
+--    `add_columnstore_policy` is a PROCEDURE — invoke with CALL.
 -- ---------------------------------------------------------------------------
-CREATE TEMP TABLE _jobs (label TEXT PRIMARY KEY, job_id INTEGER);
+CALL add_columnstore_policy(
+    hypertable    => 'sqlth_34_data',
+    after         => (7 * 86400000)::BIGINT,
+    if_not_exists => true
+);
 
-INSERT INTO _jobs VALUES
-    ('base', add_columnstore_policy('sqlth_34_data',     (7 * 86400000)::BIGINT)),
-    ('1s',   add_columnstore_policy('tag_values_1s_agg', (7 * 86400000)::BIGINT)),
-    ('1m',   add_columnstore_policy('tag_values_1m_agg', (7 * 86400000)::BIGINT));
+CALL add_columnstore_policy(
+    hypertable    => 'tag_values_1s_agg',
+    after         => (7 * 86400000)::BIGINT,
+    if_not_exists => true
+);
 
-SELECT * FROM _jobs ORDER BY label;
+-- Show the columnstore jobs that were created.
+SELECT bj.id AS job_id,
+       bj.proc_name,
+       coalesce(ca.user_view_name, ht.table_name) AS target
+FROM _timescaledb_config.bgw_job bj
+LEFT JOIN _timescaledb_catalog.hypertable      ht ON bj.hypertable_id = ht.id
+LEFT JOIN _timescaledb_catalog.continuous_agg  ca ON bj.hypertable_id = ca.mat_hypertable_id
+WHERE bj.proc_name = 'policy_compression'
+  AND (ht.table_name = 'sqlth_34_data' OR ca.user_view_name = 'tag_values_1s_agg')
+ORDER BY bj.id;
 
 -- ---------------------------------------------------------------------------
--- 8. Inspect the catalog: integer_now_func lives ONLY on the base
---    hypertable's dimension. The cagg materialization hypertables have it
---    empty — which is the trigger for the bug.
+-- 7. Catalog inspection: integer_now_func is set ONLY on the base
+--    hypertable's dimension. The cagg's materialization hypertable
+--    dimension is empty — this is the trigger for the bug.
 -- ---------------------------------------------------------------------------
 SELECT
     h.table_name,
@@ -160,139 +178,93 @@ SELECT
     coalesce(d.integer_now_func_schema, '<null>') AS integer_now_schema,
     coalesce(d.integer_now_func,        '<null>') AS integer_now_func
 FROM _timescaledb_catalog.hypertable h
-JOIN _timescaledb_catalog.dimension d ON d.hypertable_id = h.id
+JOIN _timescaledb_catalog.dimension  d ON d.hypertable_id = h.id
 WHERE h.table_name = 'sqlth_34_data'
    OR h.id IN (
         SELECT mat_hypertable_id
         FROM _timescaledb_catalog.continuous_agg
-        WHERE user_view_name IN ('tag_values_1s_agg', 'tag_values_1m_agg')
+        WHERE user_view_name = 'tag_values_1s_agg'
    )
 ORDER BY h.table_name;
 
 -- ---------------------------------------------------------------------------
--- 9. Reproduce: run the columnstore policy jobs and observe behavior.
---    Base succeeds, both caggs fail with "integer_now function not set".
+-- 8. Capture job ids into psql vars so we can CALL run_job at top level.
 -- ---------------------------------------------------------------------------
-DO $$
-DECLARE
-    j_base INT;
-    j_1s   INT;
-    j_1m   INT;
-BEGIN
-    SELECT job_id INTO j_base FROM _jobs WHERE label = 'base';
-    SELECT job_id INTO j_1s   FROM _jobs WHERE label = '1s';
-    SELECT job_id INTO j_1m   FROM _jobs WHERE label = '1m';
+SELECT bj.id AS j_base
+FROM _timescaledb_config.bgw_job bj
+JOIN _timescaledb_catalog.hypertable ht ON bj.hypertable_id = ht.id
+WHERE ht.table_name = 'sqlth_34_data'
+  AND bj.proc_name = 'policy_compression'
+\gset
 
-    RAISE NOTICE '--- running base hypertable columnstore policy (job %) ---', j_base;
-    BEGIN
-        CALL run_job(j_base);
-        RAISE NOTICE 'PASS: base policy succeeded';
-    EXCEPTION WHEN OTHERS THEN
-        RAISE NOTICE 'UNEXPECTED: base policy failed: %', SQLERRM;
-    END;
+SELECT bj.id AS j_cagg
+FROM _timescaledb_config.bgw_job bj
+JOIN _timescaledb_catalog.continuous_agg ca ON bj.hypertable_id = ca.mat_hypertable_id
+WHERE ca.user_view_name = 'tag_values_1s_agg'
+  AND bj.proc_name = 'policy_compression'
+\gset
 
-    RAISE NOTICE '--- running 1s cagg columnstore policy (job %) ---', j_1s;
-    BEGIN
-        CALL run_job(j_1s);
-        RAISE NOTICE 'UNEXPECTED: 1s cagg policy succeeded (bug not reproduced)';
-    EXCEPTION WHEN OTHERS THEN
-        RAISE NOTICE 'REPRODUCED: 1s cagg policy failed: %', SQLERRM;
-    END;
-
-    RAISE NOTICE '--- running 1m cagg columnstore policy (job %) ---', j_1m;
-    BEGIN
-        CALL run_job(j_1m);
-        RAISE NOTICE 'UNEXPECTED: 1m cagg policy succeeded (bug not reproduced)';
-    EXCEPTION WHEN OTHERS THEN
-        RAISE NOTICE 'REPRODUCED: 1m cagg policy failed: %', SQLERRM;
-    END;
-END $$;
+\echo
+\echo '*** base columnstore job id =' :j_base
+\echo '*** cagg columnstore job id =' :j_cagg
+\echo
 
 -- ---------------------------------------------------------------------------
--- 10. Show that the *manual* path works on a cagg chunk even though the
+-- 9. BEFORE: run both jobs.
+--    Base PASSES. Cagg FAILS with "integer_now function not set".
+-- ---------------------------------------------------------------------------
+\echo '=== BEFORE WORKAROUND ==='
+\echo '--- running base hypertable columnstore policy ---'
+CALL run_job(:j_base);
+
+\echo '--- running cagg columnstore policy (expect: integer_now function not set) ---'
+CALL run_job(:j_cagg);
+
+-- ---------------------------------------------------------------------------
+-- 10. Show the *manual* path still works on a cagg chunk even though the
 --     scheduled policy failed.
 -- ---------------------------------------------------------------------------
-DO $$
-DECLARE
-    mat_ht_name TEXT;
-    chunk_oid   REGCLASS;
-BEGIN
-    SELECT format('_timescaledb_internal._materialized_hypertable_%s', mat_hypertable_id)
-      INTO mat_ht_name
+SELECT format('%I.%I', chunk_schema, chunk_name) AS cagg_chunk
+FROM timescaledb_information.chunks
+WHERE hypertable_schema = '_timescaledb_internal'
+  AND hypertable_name = (
+    SELECT format('_materialized_hypertable_%s', mat_hypertable_id)
     FROM _timescaledb_catalog.continuous_agg
-    WHERE user_view_name = 'tag_values_1s_agg';
+    WHERE user_view_name = 'tag_values_1s_agg'
+  )
+  AND NOT is_compressed
+LIMIT 1
+\gset
 
-    SELECT format('%I.%I', chunk_schema, chunk_name)::regclass
-      INTO chunk_oid
-    FROM timescaledb_information.chunks
-    WHERE format('%I.%I', hypertable_schema, hypertable_name) = mat_ht_name
-      AND NOT is_compressed
-    LIMIT 1;
-
-    IF chunk_oid IS NULL THEN
-        RAISE NOTICE 'No uncompressed chunks on % — skipping manual convert test', mat_ht_name;
-        RETURN;
-    END IF;
-
-    RAISE NOTICE 'Manually converting % to columnstore...', chunk_oid;
-    BEGIN
-        PERFORM convert_to_columnstore(chunk_oid);
-        RAISE NOTICE 'PASS: manual convert_to_columnstore(%) succeeded', chunk_oid;
-    EXCEPTION WHEN OTHERS THEN
-        RAISE NOTICE 'FAIL: manual convert_to_columnstore failed: %', SQLERRM;
-    END;
-END $$;
+\echo
+\echo '--- manually converting' :cagg_chunk 'to columnstore (expect: success) ---'
+CALL convert_to_columnstore(:'cagg_chunk'::regclass);
 
 -- ===========================================================================
--- 11. WORKAROUND: set integer_now_func on each cagg's materialization
---     hypertable directly. After this, the scheduled cagg policies succeed.
+-- 11. WORKAROUND: set integer_now_func on the cagg's materialization
+--     hypertable directly. After this, the scheduled cagg policy succeeds.
 -- ===========================================================================
-DO $$
-DECLARE
-    mat_1s TEXT;
-    mat_1m TEXT;
-BEGIN
-    SELECT format('_timescaledb_internal._materialized_hypertable_%s', mat_hypertable_id)
-      INTO mat_1s
-    FROM _timescaledb_catalog.continuous_agg
-    WHERE user_view_name = 'tag_values_1s_agg';
+\echo
+\echo '=== APPLYING WORKAROUND ==='
+SELECT set_integer_now_func(
+    format('_timescaledb_internal._materialized_hypertable_%s',
+        (SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg
+         WHERE user_view_name = 'tag_values_1s_agg'))::regclass,
+    'now_ms',
+    replace_if_exists => true);
 
-    SELECT format('_timescaledb_internal._materialized_hypertable_%s', mat_hypertable_id)
-      INTO mat_1m
-    FROM _timescaledb_catalog.continuous_agg
-    WHERE user_view_name = 'tag_values_1m_agg';
+-- ---------------------------------------------------------------------------
+-- 12. AFTER: re-run the cagg job. Now it should succeed.
+-- ---------------------------------------------------------------------------
+\echo
+\echo '=== AFTER WORKAROUND ==='
+\echo '--- re-running cagg columnstore policy (expect: success) ---'
+CALL run_job(:j_cagg);
 
-    EXECUTE format($f$ SELECT set_integer_now_func(%L::regclass, 'now_ms') $f$, mat_1s);
-    EXECUTE format($f$ SELECT set_integer_now_func(%L::regclass, 'now_ms') $f$, mat_1m);
-
-    RAISE NOTICE 'Applied workaround: integer_now_func set on % and %', mat_1s, mat_1m;
-END $$;
-
--- Re-run the cagg policies after the workaround. They should now succeed.
-DO $$
-DECLARE
-    j_1s INT;
-    j_1m INT;
-BEGIN
-    SELECT job_id INTO j_1s FROM _jobs WHERE label = '1s';
-    SELECT job_id INTO j_1m FROM _jobs WHERE label = '1m';
-
-    BEGIN
-        CALL run_job(j_1s);
-        RAISE NOTICE 'POST-WORKAROUND: 1s cagg policy succeeded';
-    EXCEPTION WHEN OTHERS THEN
-        RAISE NOTICE 'POST-WORKAROUND: 1s cagg policy still failing: %', SQLERRM;
-    END;
-
-    BEGIN
-        CALL run_job(j_1m);
-        RAISE NOTICE 'POST-WORKAROUND: 1m cagg policy succeeded';
-    EXCEPTION WHEN OTHERS THEN
-        RAISE NOTICE 'POST-WORKAROUND: 1m cagg policy still failing: %', SQLERRM;
-    END;
-END $$;
-
--- Final state: count how many chunks ended up in columnstore on each ht.
+-- ---------------------------------------------------------------------------
+-- 13. Final state: cagg materialization hypertable should now show
+--     columnstore_chunks > 0.
+-- ---------------------------------------------------------------------------
 SELECT
     hypertable_name,
     count(*) FILTER (WHERE is_compressed)     AS columnstore_chunks,
